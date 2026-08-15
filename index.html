@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.0/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <style>
   :root{
     --guinda:#9F2241;
@@ -69,6 +70,11 @@
     font-size:13px;min-width:180px;font-family:inherit;
   }
   .toolbar input[type=text]:focus{outline:2px solid var(--verde);border-color:var(--verde)}
+  .toolbar input[type=number]{
+    border:1px solid var(--linea);border-radius:6px;padding:7px 8px;
+    font-size:13px;width:64px;font-family:inherit;
+  }
+  .toolbar input[type=number]:focus{outline:2px solid var(--verde);border-color:var(--verde)}
   .check{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--tinta)}
   .check input{width:16px;height:16px;accent-color:var(--verde)}
   .spacer{flex:1}
@@ -95,6 +101,11 @@
     padding:3px 12px;font-weight:700;font-size:12px;letter-spacing:.5px;
   }
   .status .warn{color:var(--error);font-weight:600}
+  .libwarn{
+    display:none;background:#fdf1ef;border:1px solid var(--error);color:var(--error);
+    border-radius:8px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:12px;
+  }
+  .libwarn.visible{display:block}
 
   /* ── Tabla ── */
   .tabla-wrap{background:#fff;border:1px solid var(--linea);border-radius:8px;overflow:hidden}
@@ -164,11 +175,17 @@
 <main>
   <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Seleccionar archivos">
     <div class="big">Arrastra aquí tus archivos o haz clic para seleccionarlos</div>
-    <div class="small">Hasta 36 archivos · el municipio se detecta del nombre del archivo y, si es PDF, del contenido del documento (incluye OCR para escaneados) · también puedes subir 1 solo archivo y generar 36 copias</div>
+    <div class="small">Hasta 36 archivos · el municipio se detecta del nombre o del contenido del PDF (con OCR para escaneados) · activa "Dividir PDFs" para partir un solo PDF escaneado en documentos por municipio</div>
     <input type="file" id="fileInput" multiple>
   </div>
 
   <div class="toolbar">
+    <div class="check">
+      <input type="checkbox" id="dividirChk">
+      <label for="dividirChk" style="color:var(--tinta)">Dividir PDFs cada</label>
+      <input type="number" id="corteInput" value="3" min="1" max="50" aria-label="Páginas por corte">
+      <label for="corteInput" style="color:var(--tinta)">páginas</label>
+    </div>
     <label for="sufijo">Sufijo opcional</label>
     <input type="text" id="sufijo" placeholder="p. ej. _FORTAMUN_2026" autocomplete="off">
     <div class="check" id="modoCopiaWrap" style="display:none">
@@ -179,6 +196,8 @@
     <button class="btn-ghost" id="btnLimpiar">Limpiar todo</button>
     <button class="btn-primary" id="btnZip" disabled>Descargar ZIP</button>
   </div>
+
+  <div class="libwarn" id="libWarn" role="alert"></div>
 
   <div class="status" id="status"></div>
 
@@ -378,16 +397,95 @@ dropzone.addEventListener("keydown", e => { if(e.key==="Enter"||e.key===" "){e.p
 dropzone.addEventListener("drop", e => addFiles([...e.dataTransfer.files]));
 fileInput.addEventListener("change", () => { addFiles([...fileInput.files]); fileInput.value=""; });
 
-function addFiles(files){
+// ── Verificación de librerías (los CDN pueden estar bloqueados en redes institucionales) ──
+window.addEventListener("load", () => {
+  const faltan = [];
+  if(!window.JSZip)    faltan.push("JSZip (descarga de ZIP)");
+  if(!window.pdfjsLib) faltan.push("pdf.js (lectura de PDFs)");
+  if(!window.Tesseract) faltan.push("Tesseract (OCR de escaneados)");
+  if(!window.PDFLib)   faltan.push("pdf-lib (división de PDFs)");
+  if(faltan.length){
+    const w = $("libWarn");
+    w.textContent = "⚠ No se pudieron cargar estas librerías desde internet: " + faltan.join(", ") +
+      ". Verifica tu conexión o si la red institucional bloquea cdnjs.cloudflare.com; esas funciones no estarán disponibles.";
+    w.classList.add("visible");
+  }
+});
+
+// ── División de PDF cada N páginas (equivalente a dividir_pdf_por_paginas.py) ──
+async function dividirPDF(file, porCorte){
+  const buf = await file.arrayBuffer();
+  const src = await PDFLib.PDFDocument.load(buf, {ignoreEncryption:true});
+  const total = src.getPageCount();
+  if(total <= porCorte) return {total, partes: null}; // igual o menor al corte: no se divide
+  const base = file.name.replace(/\.pdf$/i,"");
+  const partes = [];
+  let parte = 1;
+  for(let inicio = 0; inicio < total; inicio += porCorte){
+    const fin = Math.min(inicio + porCorte, total);
+    const doc = await PDFLib.PDFDocument.create();
+    const indices = [];
+    for(let i = inicio; i < fin; i++) indices.push(i);
+    const paginas = await doc.copyPages(src, indices);
+    paginas.forEach(p => doc.addPage(p));
+    const bytes = await doc.save();
+    const nombre = `${base}_parte${String(parte).padStart(2,"0")}.pdf`;
+    partes.push({
+      file: new File([bytes], nombre, {type:"application/pdf"}),
+      rango: [inicio + 1, fin]
+    });
+    parte++;
+  }
+  return {total, partes};
+}
+
+async function addFiles(files){
   if(!files.length) return;
   files.sort(naturalSort);
+  const dividir = $("dividirChk").checked && window.PDFLib;
+  const corte = Math.max(1, parseInt($("corteInput").value, 10) || 3);
   const usados = new Set(items.map(it => it.muniIdx).filter(i => i >= 0));
+
   for(const f of files){
     if(items.length >= 36){ alert("Solo se pueden asignar 36 archivos (uno por municipio)."); break; }
+    const esPDF = /\.pdf$/i.test(f.name) || f.type === "application/pdf";
+
+    // Modo división: partir el PDF y mandar cada parte a detección por contenido
+    if($("dividirChk").checked && esPDF && !window.PDFLib){
+      alert("La casilla de división está activada, pero la librería pdf-lib no cargó (revisa el aviso rojo arriba de la tabla). El archivo se agregará SIN dividir.");
+    }
+    if(dividir && esPDF){
+      statusEl.innerHTML = `<span class="pill">…</span><span>Dividiendo "${f.name}" cada ${corte} páginas…</span>`;
+      let resultado = null;
+      try{
+        resultado = await dividirPDF(f, corte);
+      }catch(e){
+        console.error("División:", f.name, e);
+        alert(`No se pudo dividir "${f.name}": ${e.message}`);
+      }
+      if(resultado && !resultado.partes){
+        alert(`"${f.name}" tiene ${resultado.total} página(s), igual o menor al corte de ${corte}. No se divide (igual que el script de Python); se agrega como un solo archivo.`);
+      }
+      if(resultado && resultado.partes){
+        for(const p of resultado.partes){
+          if(items.length >= 36){ alert("Se alcanzó el límite de 36 partes/archivos."); break; }
+          items.push({
+            file: p.file,
+            muniIdx: -1,
+            fuente: null,
+            desc: `${f.name} · págs ${p.rango[0]}–${p.rango[1]}`,
+            ocr: window.pdfjsLib ? "pendiente" : null
+          });
+        }
+        render();
+        continue; // ya se agregaron las partes; siguiente archivo
+      }
+      // sin partes → sigue el flujo normal (se agrega entero)
+    }
+
     let idx = detectarMunicipio(f.name);
     if(idx >= 0 && usados.has(idx)) idx = -1; // ya ocupado → que el usuario decida
     if(idx >= 0) usados.add(idx);
-    const esPDF = /\.pdf$/i.test(f.name) || f.type === "application/pdf";
     items.push({
       file: f,
       muniIdx: idx,
@@ -449,7 +547,7 @@ function render(){
 
     const tdOrig = document.createElement("td");
     tdOrig.className = "orig";
-    tdOrig.textContent = it.file.name;
+    tdOrig.textContent = it.desc || it.file.name;
 
     const tdSel = document.createElement("td");
     if(modoCopia.checked){
@@ -497,6 +595,19 @@ function render(){
 }
 
 sufijoEl.addEventListener("input", render);
+
+// Si activan la división con archivos ya cargados, ofrecer re-procesarlos
+$("dividirChk").addEventListener("change", async () => {
+  if(!$("dividirChk").checked || !items.length) return;
+  const pdfsEnteros = items.filter(it => !it.desc && (/\.pdf$/i.test(it.file.name) || it.file.type === "application/pdf"));
+  if(!pdfsEnteros.length) return;
+  if(confirm(`Ya hay ${pdfsEnteros.length} PDF(s) cargado(s) sin dividir. ¿Quieres volver a procesarlos ahora dividiéndolos cada ${$("corteInput").value} páginas?`)){
+    const archivos = pdfsEnteros.map(it => it.file);
+    items = items.filter(it => !pdfsEnteros.includes(it));
+    render();
+    await addFiles(archivos);
+  }
+});
 
 $("btnLimpiar").addEventListener("click", () => { items = []; modoCopia.checked = false; render(); });
 
